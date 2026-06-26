@@ -4,11 +4,11 @@ GIS extractor for Nepal municipality monthly sweeps.
 Behavior:
 - Uses `searchType=W`
 - Loads municipality codes from `codes.csv`
-- Processes all 753 municipalities for one Nepali month per run
+- Processes all 753 municipalities for one Nepali month per run.
 - Every run processes exactly ONE month.
 - After finishing a month, if the next month is also completed, it schedules the next run in 20 minutes.
-- If the next month is the current (uncompleted) month, it schedules the next run for the 1st of the next
-  Nepali month at a random time between 5-8 AM NPT.
+- When it reaches the current (uncompleted) Nepali month, it parks and polls daily (every 24 hours)
+  using the interval settings.
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import datetime
 import os
-import random
 
 import nepali_datetime
 from dotenv import load_dotenv
@@ -26,8 +25,6 @@ from nthrow.source import SimpleSource
 from nthrow.utils import create_db_connection, create_store
 
 from gis_municipality_codes import load_municipality_codes
-
-NPT = datetime.timezone(datetime.timedelta(hours=5, minutes=45))
 
 
 def build_nepali_months(start_year: int = 2078) -> list[str]:
@@ -50,28 +47,6 @@ def month_bounds(month_key: str) -> tuple[str, str]:
     return f"{year}-{month}-01", f"{year}-{month}-32"
 
 
-def compute_next_monthly_run_time() -> datetime.datetime:
-    """Return the UTC datetime for the 1st of next Nepali month at a random
-    time between 5:00 and 8:00 AM NPT (stored as UTC in PostgreSQL)."""
-    today_np = nepali_datetime.date.today()
-    if today_np.month == 12:
-        next_year = today_np.year + 1
-        next_month = 1
-    else:
-        next_year = today_np.year
-        next_month = today_np.month + 1
-
-    hour = random.randint(5, 8)
-    minute = random.randint(0, 59)
-
-    next_run_np = nepali_datetime.datetime(next_year, next_month, 1, hour, minute, 0)
-    next_run_greg_naive = next_run_np.to_datetime_datetime()
-
-    next_run_npt = next_run_greg_naive.replace(tzinfo=NPT)
-    next_run_utc = next_run_npt.astimezone(datetime.timezone.utc)
-    return next_run_utc
-
-
 class GisMunicipalityExtractor(SimpleSource):
     """Scrape GIS data month-by-month across all municipalities."""
 
@@ -86,9 +61,28 @@ class GisMunicipalityExtractor(SimpleSource):
         return {
             "pagination": {
                 "from": None,
-                "to": {"month_index": 0, "municipality_index": 0},
+                "to": {
+                    "month_index": 0,
+                    "municipality_index": 0,
+                },
             },
         }
+
+    def _has_more_pages(self, row, types=["from", "to"]):
+        if "to" in types:
+            self.load_schedule()
+            pagi = (row.get("state") or {}).get("pagination") or {}
+            to_val = pagi.get("to")
+            if to_val is None:
+                return False
+            if to_val == "":
+                return True
+            if isinstance(to_val, dict):
+                month_index = to_val.get("month_index", 0)
+                if month_index >= len(self.month_keys) - 1:
+                    return False
+            return True
+        return False
 
     def load_schedule(self):
         if self._schedule_loaded:
@@ -100,7 +94,6 @@ class GisMunicipalityExtractor(SimpleSource):
 
         print(f"* Loaded {len(self.municipality_codes)} municipality codes from codes.csv")
         print(f"* Loaded {len(self.month_keys)} Nepali months (2078-01 through {self.month_keys[-1]})")
-        print(f"* Total requests: {len(self.municipality_codes) * len(self.month_keys)}")
 
     def _current_plan(self, row):
         self.load_schedule()
@@ -142,7 +135,12 @@ class GisMunicipalityExtractor(SimpleSource):
         if month_index >= len(self.month_keys):
             return None
 
-        return {"month_index": month_index, "municipality_index": municipality_index}
+        next_to = {
+            "month_index": month_index,
+            "municipality_index": municipality_index,
+        }
+
+        return next_to
 
     def make_url(self, row, _type):
         plan = self._current_plan(row)
@@ -158,11 +156,24 @@ class GisMunicipalityExtractor(SimpleSource):
 
     async def fetch_rows(self, row, _type="to"):
         try:
-            result = self.make_url(row, _type)
-            if result[0] is None:
+            self.load_schedule()
+            plan = self._current_plan(row)
+            if not plan:
                 return {"rows": [], "state": {"pagination": {"to": None, "from": None}}}
 
-            url, plan = result
+            # If we reached the current month (or beyond), park the cursor at the current month
+            # and do not fetch anything.
+            if plan["month_index"] >= len(self.month_keys) - 1:
+                parked_to = {
+                    "month_index": plan["month_index"],
+                    "municipality_index": 0,
+                }
+                return {
+                    "rows": [],
+                    "state": {"pagination": {"to": parked_to, "from": None}},
+                }
+
+            url, plan = self.make_url(row, _type)
             res = await self.http_get(url, verify=False)
             if res.status_code != 200:
                 self.logger.error(f"Non-200 HTTP response: {res.status_code} for {url}")
@@ -204,34 +215,22 @@ class GisMunicipalityExtractor(SimpleSource):
             self.logger.exception(exc)
             return self.make_error("Exception", type(exc).__name__, str(exc))
 
-    def _set_next_update_at(self, next_update_at: datetime.datetime):
-        """Directly write next_update_at on the list row in the database."""
-        row = self.get_list_row()
-        row["next_update_at"] = next_update_at
-        self.insert_rows([row])
-
     async def run(self):
-
         self.load_schedule()
 
         row = self.get_list_row()
-        start_plan = self._current_plan(row)
-        if not start_plan:
-            print("* All months complete. Waiting for next scheduled run.")
+        plan = self._current_plan(row)
+        if not plan:
             return
 
-        current_month_index = start_plan["month_index"]
+        current_month_index = plan["month_index"]
 
-        # If the cursor is already pointing to the current (uncompleted) month, we must wait.
+        # If at the current month, let collect_rows run once to write the next daily check schedule
         if current_month_index >= len(self.month_keys) - 1:
-            print(
-                f"* Month {self.month_keys[current_month_index]} is the current month and is not complete. "
-                "Waiting for next scheduled run."
-            )
+            await self.collect_rows(row)
             return
 
-        print(f"* Starting run for month {self.month_keys[current_month_index]}")
-
+        # Otherwise, process the completed month's municipalities in a loop
         while True:
             row = self.get_list_row()
             plan = self._current_plan(row)
@@ -240,36 +239,7 @@ class GisMunicipalityExtractor(SimpleSource):
 
             result = await self.collect_rows(row)
             if result != 0:
-                print(f"* Error on municipality {plan['municipality_index']} — stopping run.")
-                return
-
-        # Fetch the row again to read the updated cursor pagination state
-        row = self.get_list_row()
-        next_plan = self._current_plan(row)
-
-        if next_plan:
-            next_month_index = next_plan["month_index"]
-            if next_month_index < len(self.month_keys) - 1:
-                next_update_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=20)
-                print(
-                    f"* Completed month {self.month_keys[current_month_index]}. "
-                    f"Scheduling next run in 20 minutes."
-                )
-            else:
-                next_update_at = compute_next_monthly_run_time()
-                next_run_npt = next_update_at.astimezone(NPT)
-                print(
-                    f"* Completed month {self.month_keys[current_month_index]}. "
-                    f"Next month {self.month_keys[next_month_index]} is the current month (uncompleted). "
-                    f"Scheduling next run for 1st of next Nepali month at {next_run_npt.strftime('%H:%M')} NPT."
-                )
-        else:
-            next_update_at = compute_next_monthly_run_time()
-            print("* Reached the end of month keys. Scheduling next run for 1st of next month.")
-
-        row["next_update_at"] = next_update_at
-        self.insert_rows([row])
-
+                break
 
 async def main():
     load_dotenv()
@@ -299,15 +269,12 @@ async def main():
     extractor = GisMunicipalityExtractor(conn, table_name)
     extractor.set_list_info("https://gis.donidcr.gov.np:3001/api/gis")
 
-    # delay=20  : minutes to wait between MONTH runs.
-    #             Each full month (753 municipalities) counts as one "page" from
-    #             the scheduler's perspective, so delay fires once per month run.
-    # interval=0: disabled — after active months complete we set next_update_at
-    #             manually to the 1st of the next Nepali month at 5-8 AM NPT.
+    # delay=20     : minutes to wait between MONTH runs.
+    # interval=1440: minutes to wait (1 day) when parked at the current month.
     extractor.update_settings({
         "remote": {
             "refresh": {
-                "interval": 0,
+                "interval": 1440,
                 "delay": 20,
             },
         }
@@ -329,9 +296,7 @@ async def main():
             f"Month: {data.get('month_key')} | "
             f"Name: {data.get('municipality_name')}"
         )
-
     conn.close()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
