@@ -1,0 +1,3 @@
+nepali-datetime
+python-dotenv
+git+ssh://git@github.com/ankamala/nthrow.git@6d1a7c99709064e042430884753a0fc570d4516e#egg=nthrow
